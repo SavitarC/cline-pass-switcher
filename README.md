@@ -23,7 +23,7 @@
 ## 30 秒上手（本地）
 
 ```bash
-git clone https://github.com/<你的用户名>/cline-pass-switcher.git
+git clone https://github.com/SavitarC/cline-pass-switcher.git
 cd cline-pass-switcher
 node server.js        # 仅需 Node ≥ 18，无需 npm install
 ```
@@ -100,7 +100,7 @@ location / {
 | `publicBaseUrl` | 公网代理地址（控制台展示用） |
 | `exposeCatalog` | `true` 时代理的 `/v1/models` 会合并 Cline 公开目录模型；默认 `false` 只返回订阅模型（避免客户端模型列表被淹没） |
 | `knownModels` | 订阅模型清单（控制台主表） |
-| `perModel` | 每模型的配置：`{ upstreams, exclude, pinMode: strict|preferred, sort: cost|ttft|tps, has }`；`has` 为 `vision`、`implicit-caching` 的数组 |
+| `perModel` | 每模型配置，包含 `upstreams`、`exclude`、`pinMode`、`sort` 和 `has`；`has` 为 `vision`、`implicit-caching` 的数组 |
 | `apiKey` | 旧版单 key 字段，启动时自动迁移进 `accounts` |
 
 ---
