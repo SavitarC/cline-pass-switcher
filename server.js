@@ -32,6 +32,7 @@ const DEFAULT_CONFIG = {
     'cline-pass/kimi-k3',
     'cline-pass/deepseek-v4-flash',
     'cline-pass/deepseek-v4.1-flash',
+    'cline-pass/deepseek-v4.1-flash-1017',
     'cline-pass/qwen3.8-max',
     'cline-pass/minimax-m3',
     'cline-pass/glm-5.3',
@@ -45,7 +46,8 @@ const DEFAULT_CONFIG = {
     'cline-pass/qwen3.7-max',
   ],
   // modelId -> { upstreams: string[]（有序优先列表，空=自动）, exclude: string[]（排除列表，优先级高于勾选）,
-  //              pinMode: 'strict'|'preferred', sort: 'cost'|'ttft'|'tps'|null }
+  //              pinMode: 'strict'|'preferred', sort: 'cost'|'ttft'|'tps'|null,
+  //              has: ('vision'|'implicit-caching')[] }
   // 请求按 upstreams 顺序逐个钉住尝试：第一个异常（非 200 / 网络失败 / 超时）自动顺切下一个，
   // 全部失败才把最后一个错误透传给客户端；exclude 中的上游永不被使用（自动模式下注入排除偏好）。
   // upstream 为旧版单上游兼容镜像（取列表第一个），maxRetries 已退役（旧值仅作回滚兼容保留在文件里）。
@@ -335,7 +337,7 @@ function learnAvailableProviders(modelId, errMsg) {
 async function validateUpstreams(modelId) {
   const meta = META.models[modelId] || {};
   const list = meta.upstreams || [];
-  const pipeline = meta.pipeline;
+  const cfg = config.perModel[modelId] || {};
   const acc = pickAccount();
   const results = {};
   const batch = 5;
@@ -343,9 +345,7 @@ async function validateUpstreams(modelId) {
     await Promise.all(list.slice(i, i + batch).map(async (slug) => {
       const t0 = Date.now();
       const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
-      const body = pipeline === 'planner'
-        ? { ...base, providerOptions: { gateway: { only: [slug] } } }
-        : { ...base, provider: { only: [slug] } };
+      const body = injectPrefs(base, modelId, { upstream: slug, has: Array.isArray(cfg.has) ? cfg.has : [] });
       const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
         method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body),
       }, 60000).catch(() => ({ json: { error: 'network error' } }));
@@ -460,18 +460,22 @@ function unwrap(json) {
 // - 直连管道（OpenRouter）：顶层 provider.{only,order,sort} 生效；providerOptions 被忽略。
 // - 管道未知时两种形式同时注入，各自取用、互不干扰。
 const OR_SORT = { cost: 'price', ttft: 'latency', tps: 'throughput' };
+const CAPABILITIES = ['vision', 'implicit-caching'];
+const unsupportedCapabilities = (modelId, cfg) =>
+  Array.isArray(cfg?.has) && cfg.has.length > 0 && META.models[modelId]?.pipeline === 'direct';
+const capabilityError = '该模型使用 OpenRouter 直连管道，无法保证 Vercel 网关能力筛选生效；请取消能力筛选或重新探测';
 
 // upstream: 本次尝试钉住的上游（null=自动）；orderRest: preferred 模式下排在当前上游之后的回退序列；
 // excludeList: 排除列表。网关不支持 exclude/ignore 字段（实测被静默忽略），因此排除统一换算成 only 白名单：
 // 自动模式 only=已知上游-排除；preferred 钉住模式 order=[当前,...] 且 only=已知上游-排除（防止网关回退到被排除渠道）；
 // 严格钉住模式 only=[当前上游]，天然排除其他一切渠道。
-function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = [], strict = true, sort = null }) {
+function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = [], strict = true, sort = null, has = [] }) {
   const b = JSON.parse(JSON.stringify(body));
   const exclude = (excludeList || []).filter((u) => u !== upstream);
   const meta = META.models[modelId] || {};
   const known = meta.upstreams || [];
   const allowList = exclude.length ? known.filter((u) => !exclude.includes(u)) : null;
-  if (!upstream && !sort && !(allowList && allowList.length)) return b;
+  if (!upstream && !sort && !has.length && !(allowList && allowList.length)) return b;
   const pipeline = meta.pipeline || null;
   const useVercel = pipeline === 'planner' || pipeline === null;
   const useOpenRouter = pipeline === 'direct' || pipeline === null;
@@ -487,6 +491,10 @@ function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = []
       gw.only = allowList;
     }
     if (sort) gw.sort = sort;
+    if (has.length) {
+      const requested = Array.isArray(b.providerOptions?.gateway?.has) ? b.providerOptions.gateway.has : [];
+      gw.has = [...new Set([...requested, ...has])];
+    }
     b.providerOptions = { ...(b.providerOptions || {}), gateway: { ...(b.providerOptions?.gateway || {}), ...gw } };
   }
   if (useOpenRouter) {
@@ -516,7 +524,8 @@ function buildAttempts(modelId, cfg) {
   const wanted = listed.filter((u) => !excl.has(u));
   const strict = (cfg?.pinMode || 'strict') === 'strict';
   const sort = cfg?.sort || null;
-  const base = { strict, sort, excludeList: exclude };
+  const has = Array.isArray(cfg?.has) ? cfg.has : [];
+  const base = { strict, sort, has, excludeList: exclude };
   if (wanted.length) {
     // preferred 模式：当前上游排在 order 首位，其余勾选项作为网关侧回退序列；排除列表随行（限制网关回退范围）
     return wanted.map((u, i) => ({ ...base, upstream: u, orderRest: strict ? [] : wanted.filter((_, j) => j !== i) }));
@@ -553,6 +562,9 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
   const attempts = buildAttempts(modelId, cfg);
   const trace = [];
   const t0 = Date.now();
+  if (unsupportedCapabilities(modelId, cfg)) {
+    return { status: 400, out: { error: { message: capabilityError, type: 'invalid_request_error' } }, routing: {}, trace, t0 };
+  }
   let last = null;
   let activeCtrl = null;            // 当前尝试的 AbortController；流式成功后保持指向该次 fetch，用于断连时中止上游 body
   let keepCloseHook = false;        // 流式 SSE 建立后，close 钩子要保留到流结束
@@ -660,10 +672,19 @@ async function handleChat(req, res) {
   if (!modelId) return sendJSON(res, 400, { error: { message: 'model is required' } });
 
   const cfg = config.perModel[modelId] || {};
+  const requestedHas = body.providerOptions?.gateway?.has;
+  if (cfg.has?.length && requestedHas !== undefined && !Array.isArray(requestedHas)) {
+    return sendJSON(res, 400, { error: { message: 'providerOptions.gateway.has must be an array' } });
+  }
   const targets = buildAttempts(modelId, cfg).map((a) => a.upstream).filter(Boolean);
   const isStream = !!body.stream;
 
   const chain = await runChatChain(req, body, modelId, cfg, { stream: isStream });
+
+  if (chain.status === 200 && /^cline-pass\//.test(String(modelId)) && !config.knownModels.includes(modelId)) {
+    config.knownModels.push(modelId);
+    saveConfig();
+  }
 
   if (isStream && chain.streamUp) {
     // 流式透传：先写已探测的首块，再接剩余 body；tap 在结束时回读路由元数据并记录
@@ -714,11 +735,6 @@ async function handleChat(req, res) {
 
   const { status, out, routing, acc } = chain;
   if (!out) return sendJSON(res, 502, { error: { message: 'no upstream response', type: 'upstream_error' } });
-  // 客户端实际使用成功的新订阅模型自动收录进列表
-  if (status === 200 && /^cline-pass\//.test(String(modelId)) && !config.knownModels.includes(modelId)) {
-    config.knownModels.push(modelId);
-    saveConfig();
-  }
   record(modelId, {
     provider: routing.finalProvider || null,
     canonical: routing.canonicalSlug || null,
@@ -878,6 +894,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/api/validate-upstreams') {
       const { model } = JSON.parse(await readBody(req).then((b) => b.toString()));
       if (!model) return sendJSON(res, 400, { error: { message: 'model required' } });
+      if (unsupportedCapabilities(model, config.perModel[model])) {
+        return sendJSON(res, 400, { error: { message: capabilityError } });
+      }
       const results = await validateUpstreams(model);
       const summary = { ok: 0, limited: 0, bad: 0, auth: 0, unknown: 0 };
       for (const r of Object.values(results)) summary[r.status] = (summary[r.status] || 0) + 1;
@@ -892,6 +911,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/api/config') {
       const body = JSON.parse(await readBody(req).then((b) => b.toString()));
       if (body.perModel) {
+        if (Object.values(body.perModel).some((c) =>
+          c?.has !== undefined && (!Array.isArray(c.has) || c.has.some((v) => !CAPABILITIES.includes(v))))) {
+          return sendJSON(res, 400, { error: { message: 'has must contain only vision or implicit-caching' } });
+        }
         for (const [m, c] of Object.entries(body.perModel)) {
           const normalize = (v) => [...new Set((Array.isArray(v) ? v : []).map((s) => String(s).trim()).filter(Boolean))].slice(0, 10);
           let upstreams = normalize(c.upstreams);
@@ -905,6 +928,7 @@ const server = http.createServer(async (req, res) => {
             exclude,
             pinMode: c.pinMode === 'preferred' ? 'preferred' : 'strict',
             sort: ['cost', 'ttft', 'tps'].includes(c.sort) ? c.sort : null,
+            has: c.has === undefined ? (config.perModel[m]?.has || []) : [...new Set(c.has)],
           };
         }
         saveConfig();

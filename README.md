@@ -8,6 +8,7 @@
 
 - 🔍 **上游枚举与校验** —— 列出订阅模型背后每一条上游渠道，并一键实测哪些「✔可用 / ⏳限流 / ✘不可钉」
 - 🎯 **精确钉住上游** —— 严格钉住 / 优先+回退两种模式，支持按最低成本、最快首字、最高吞吐排序
+- 🧩 **模型能力筛选** —— 可按模型要求图片输入（`vision`）和自动缓存（`implicit-caching`），与上游限制一起交给 Vercel AI Gateway
 - 🧬 **多上游优先级故障转移（2026-09-06 新增）** —— 勾选多个上游即按勾选顺序逐个尝试：第一个异常（报错 / 网络失败 / 超时）自动顺切下一个，全部失败才透传错误；每次尝试有独立 120s 超时与逐次尝试明细（请求头 X-Cline-Target-Upstream: a>b 与 X-Cline-Attempts，历史与测试台展示逐次尝试路径 upstream(502) 到 upstream(200)）
 - 🚫 **上游排除** —— 勾「排除」的渠道永不被使用：勾选模式下从候选中剔除；自动模式与优先+回退模式下把排除换算成 only 白名单（已知上游 - 排除项）注入，两类管道均实测生效；网关侧渠道清单更新导致白名单过期时，报错中附带的最新渠道清单会被自动学习合并
 - 👥 **账号池** —— 多账号管理、手动切换、轮询均衡、逐账号连通性测试与用量统计
@@ -99,7 +100,7 @@ location / {
 | `publicBaseUrl` | 公网代理地址（控制台展示用） |
 | `exposeCatalog` | `true` 时代理的 `/v1/models` 会合并 Cline 公开目录模型；默认 `false` 只返回订阅模型（避免客户端模型列表被淹没） |
 | `knownModels` | 订阅模型清单（控制台主表） |
-| `perModel` | 每模型的钉住配置：`{ upstream, pinMode: strict|preferred, sort: cost|ttft|tps, maxRetries }` |
+| `perModel` | 每模型的配置：`{ upstreams, exclude, pinMode: strict|preferred, sort: cost|ttft|tps, has }`；`has` 为 `vision`、`implicit-caching` 的数组 |
 | `apiKey` | 旧版单 key 字段，启动时自动迁移进 `accounts` |
 
 ---
@@ -126,6 +127,28 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 
 实测响应：`finalProvider: "alibaba"`，规划器理由变为 `Provider set restricted to: alibaba`。
 参考：[Vercel AI Gateway — Provider Filtering, Ordering & Sorting](https://vercel.com/docs/ai-gateway/models-and-providers/provider-filtering-and-ordering)
+
+### 按模型筛选能力
+
+在订阅模型行中勾选需要的「图片输入」和「自动缓存」，并选择上游与「严格钉住」。例如为 `cline-pass/deepseek-v4.1-flash-1017` 选择 `deepseek` 和两项能力后，发送给 Cline 的请求包含：
+
+```json
+{
+  "model": "cline-pass/deepseek-v4.1-flash-1017",
+  "messages": [{ "role": "user", "content": "OK" }],
+  "stream": true,
+  "providerOptions": {
+    "gateway": {
+      "only": ["deepseek"],
+      "has": ["vision", "implicit-caching"]
+    }
+  }
+}
+```
+
+`has` 是网关的能力过滤参数，不是提示词；多个能力必须同时满足。如果客户端请求已带有 `providerOptions.gateway.has`，代理会保留原有能力并合并控制台设置。能力筛选默认关闭；模型探测仍不受筛选限制，测试和渠道校验会带上筛选。
+
+能力筛选适用于 Vercel AI Gateway 管道。对已探测为 OpenRouter 直连的模型，开启能力筛选后代理会返回错误，不会静默忽略；未知管道会同时发送两种上游格式，但需先探测并验证网关是否采纳筛选。没有匹配所有条件的上游时，请求可能失败。参考：[Vercel AI Gateway — Model Filtering](https://vercel.com/docs/ai-gateway/models-and-providers/model-filtering)。
 
 ### 上游枚举的三种手段
 

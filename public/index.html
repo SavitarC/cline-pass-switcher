@@ -35,7 +35,7 @@
   .badge.orange { background: #3d2f1a; color: var(--orange); }
   select, input[type=number] { background: var(--card2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 12.5px; max-width: 200px; }
   input[type=number] { width: 64px; }
-  .row-actions { display: flex; gap: 6px; }
+  .row-actions { display: flex; gap: 6px; white-space: nowrap; }
   .result { margin-top: 12px; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.8; display: none; white-space: pre-wrap; word-break: break-all; }
   .kvs { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 8px; }
   .kvs div { font-size: 12.5px; color: var(--dim); }
@@ -82,6 +82,10 @@
   .trace .tr { font-family: Consolas, monospace; }
   .trace .tr.ok { color: var(--green); }
   .trace .tr.bad { color: var(--orange); }
+  @media (max-width: 700px) {
+    body { padding: 12px; }
+    .card { overflow-x: auto; }
+  }
 </style>
 </head>
 <body>
@@ -171,7 +175,7 @@
     <div class="result" id="fetchResult" style="display:none; margin-bottom:12px;"></div>
     <table>
       <thead><tr>
-        <th>模型</th><th>背后模型</th><th>上游数</th><th>最近实际上游</th><th>上游优先级 / 排除（多选）</th><th>模式 / 排序</th><th>操作</th>
+        <th>模型</th><th>背后模型</th><th>上游数</th><th>最近实际上游</th><th>上游优先级 / 排除（多选）</th><th>模式 / 排序 / 能力</th><th>操作</th>
       </tr></thead>
       <tbody id="subBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
     </table>
@@ -211,6 +215,7 @@
 <script>
 let DATA = null;
 let AUTH_KEY = localStorage.getItem('cps_key') || '';
+const modelSaves = new Map();
 const $ = (s) => document.querySelector(s);
 const fmt = (ts) => new Date(ts).toLocaleTimeString();
 
@@ -322,6 +327,7 @@ function render() {
     const pipe = m?.pinnable ? `<span class="badge green">可精确钉住·${m.pipeline === 'planner' ? 'Vercel' : 'OpenRouter'}</span>` : '<span class="badge orange">请先探测</span>';
     const mode = s.config.pinMode || 'strict';
     const sort = s.config.sort || '';
+    const has = Array.isArray(s.config.has) ? s.config.has : [];
     return `<tr${LAST_ADDED.includes(s.id) ? ' class="row-new"' : ''} data-id="${s.id}">
       <td class="mono">${s.id}<div style="margin-top:4px">${pipe}</div>${tier0}</td>
       <td>${canon}</td>
@@ -341,6 +347,10 @@ function render() {
           <option value="ttft" ${sort === 'ttft' ? 'selected' : ''}>最快首字</option>
           <option value="tps" ${sort === 'tps' ? 'selected' : ''}>最高吞吐</option>
         </select>
+        <div class="dim" style="font-size:11px; margin-top:8px">能力筛选</div>
+        <label style="display:block; margin-top:4px"><input type="checkbox" ${has.includes('vision') ? 'checked' : ''} onchange="saveHas('${s.id}','vision',this.checked)"> 图片输入 (vision)</label>
+        <label style="display:block; margin-top:4px"><input type="checkbox" ${has.includes('implicit-caching') ? 'checked' : ''} onchange="saveHas('${s.id}','implicit-caching',this.checked)"> 自动缓存 (implicit-caching)</label>
+        <div class="dim" style="font-size:11px; margin-top:4px">仅 Vercel 规划器 / 未知管道；已识别直连时启用会报错</div>
       </td>
       <td><div class="row-actions">
         <button class="ghost" onclick="probe('${s.id}', this)">探测</button>
@@ -484,9 +494,10 @@ async function validate(id, btn) {
   status(`正在校验 ${id} 的全部上游渠道（约需 1 分钟）…`);
   try {
     const r = await api('/api/validate-upstreams', { model: id });
+    if (!r.ok) throw new Error(r.error?.message || '未知错误');
     status(`校验完成：✔可用 ${r.summary.ok} · ⏳限流 ${r.summary.limited} · ✘不可钉 ${r.summary.bad} · 🔑key错 ${r.summary.auth} · 未判定 ${r.summary.unknown}（下拉框已标注并排序）`);
   } catch (e) {
-    status('校验失败');
+    status(`校验失败：${e.message || '未知错误'}`);
   }
   btn.disabled = false; btn.textContent = '校验';
   await loadAll();
@@ -531,29 +542,45 @@ function showTest(r, model, target) {
     <div class="dim" style="margin-top:6px">回复：${escapeHtml(r.content || '(空)')}　·　背后模型：${r.canonicalSlug || '—'}　·　管道：${r.pipeline === 'direct' ? '直连(OpenRouter)' : r.pipeline === 'planner' ? '规划器(Vercel)' : '未知'}</div>`;
 }
 
-// —— perModel 配置保存：POST 完整字段（upstreams + exclude 一起），UI 由调用方乐观更新 ——
+// —— perModel 配置保存：同步更新本地状态，按模型串行提交完整字段 ——
 async function saveModelCfg(id, patch) {
   const s = DATA.subscription.find((x) => x.id === id);
   if (!s) return;
   const cfg = s.config;
+  Object.assign(cfg, patch);
   const full = {
-    upstreams: patch.upstreams !== undefined ? patch.upstreams : (cfg.upstreams || []),
-    exclude: patch.exclude !== undefined ? patch.exclude : (cfg.exclude || []),
-    pinMode: patch.pinMode !== undefined ? patch.pinMode : (cfg.pinMode || 'strict'),
-    sort: patch.sort !== undefined ? patch.sort : (cfg.sort || null),
+    ...cfg,
+    upstreams: cfg.upstreams || [],
+    exclude: cfg.exclude || [],
+    pinMode: cfg.pinMode || 'strict',
+    sort: cfg.sort || null,
+    has: Array.isArray(cfg.has) ? cfg.has : [],
   };
-  try {
+  const pending = (modelSaves.get(id) || Promise.resolve()).catch(() => {}).then(async () => {
     const r = await api('/api/config', { perModel: { [id]: full } });
-    if (r.ok) {
-      cfg.upstreams = full.upstreams; cfg.exclude = full.exclude; cfg.pinMode = full.pinMode; cfg.sort = full.sort;
-      status(`${id} 配置已保存`);
-    } else {
-      status(`${id} 保存失败：${r.error?.message || '未知错误'}`);
+    if (!r.ok) throw new Error(r.error?.message || '未知错误');
+  });
+  modelSaves.set(id, pending);
+  try {
+    await pending;
+    if (modelSaves.get(id) === pending) status(`${id} 配置已保存`);
+  } catch (e) {
+    if (modelSaves.get(id) === pending) {
+      modelSaves.delete(id);
+      status(`${id} 保存失败：${e.message || '未知错误'}`);
       await loadAll();
     }
-  } catch {
-    await loadAll();
+  } finally {
+    if (modelSaves.get(id) === pending) modelSaves.delete(id);
   }
+}
+
+function saveHas(id, value, checked) {
+  const cfg = DATA.subscription.find((s) => s.id === id)?.config;
+  if (!cfg) return;
+  const has = new Set(Array.isArray(cfg.has) ? cfg.has : []);
+  if (checked) has.add(value); else has.delete(value);
+  saveModelCfg(id, { has: [...has] });
 }
 
 // 下拉框保存入口（模式/排序）
