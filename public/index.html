@@ -213,8 +213,11 @@
   </div>
 
 <script>
+const APP_BASE = new URL('.', window.location.href).pathname.replace(/\/$/, '');
+const AUTH_STORAGE_KEY = `cps_key:${APP_BASE || '/'}`;
+const apiUrl = (path) => APP_BASE + path;
 let DATA = null;
-let AUTH_KEY = localStorage.getItem('cps_key') || '';
+let AUTH_KEY = localStorage.getItem(AUTH_STORAGE_KEY) || (!APP_BASE && localStorage.getItem('cps_key')) || '';
 const modelSaves = new Map();
 const $ = (s) => document.querySelector(s);
 const fmt = (ts) => new Date(ts).toLocaleTimeString();
@@ -222,7 +225,7 @@ const fmt = (ts) => new Date(ts).toLocaleTimeString();
 async function api(path, body) {
   const headers = body ? { 'Content-Type': 'application/json' } : {};
   if (AUTH_KEY) headers['X-Admin-Key'] = AUTH_KEY;
-  const res = await fetch(path, body ? { method: 'POST', headers, body: JSON.stringify(body) } : { headers });
+  const res = await fetch(apiUrl(path), body ? { method: 'POST', headers, body: JSON.stringify(body) } : { headers });
   if (res.status === 401) { showLogin(); throw new Error('unauthorized'); }
   return res.json();
 }
@@ -231,9 +234,9 @@ function showLogin() { $('#loginOverlay').style.display = 'flex'; setTimeout(() 
 async function tryLogin() {
   const k = $('#loginKey').value.trim();
   if (!k) return;
-  const res = await fetch('/api/models', { headers: { 'X-Admin-Key': k } });
+  const res = await fetch(apiUrl('/api/models'), { headers: { 'X-Admin-Key': k } });
   if (res.ok) {
-    AUTH_KEY = k; localStorage.setItem('cps_key', k);
+    AUTH_KEY = k; localStorage.setItem(AUTH_STORAGE_KEY, k);
     $('#loginOverlay').style.display = 'none'; $('#loginErr').textContent = '';
     loadAll();
   } else {
@@ -418,7 +421,7 @@ async function saveSecurity() {
   const r = await api('/api/security', payload);
   if (r.ok) {
     // 控制台鉴权与代理密钥同源：改完立即换新密钥，避免会话失效
-    if (r.proxyKey) { AUTH_KEY = r.proxyKey; localStorage.setItem('cps_key', r.proxyKey); }
+    if (r.proxyKey) { AUTH_KEY = r.proxyKey; localStorage.setItem(AUTH_STORAGE_KEY, r.proxyKey); }
     renderSecurity(r);
     DATA.proxyBase = r.proxyBase;
     $('#proxyBase').textContent = '代理地址：' + r.proxyBase + '（点击复制）';
@@ -787,7 +790,7 @@ $('#loginKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') tryLo
 // 仅当服务端开启鉴权且本地没有已保存的密钥时才弹登录框
 (async () => {
   try {
-    const meta = await (await fetch('/api/meta')).json();
+    const meta = await (await fetch(apiUrl('/api/meta'))).json();
     if (meta.authRequired && !AUTH_KEY) showLogin();
     else loadAll().catch(() => {});
   } catch {
